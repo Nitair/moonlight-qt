@@ -290,6 +290,11 @@ public:
         return true;
     }
 
+    virtual bool configureDecoderSession(AVCodecContext*) {
+        // Allow backends to tune hardware sessions once the decoder is live.
+        return true;
+    }
+
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO) {
         // Assume the renderer cannot handle window state changes
         return false;
@@ -299,6 +304,16 @@ public:
         // Allow renderers to perform any final preparations for
         // rendering after they have been selected to render. Such
         // preparations might include clearing the window.
+    }
+
+    virtual void appendDebugOverlayStats(char* output, int length, int* offset) {
+        (void)output;
+        (void)length;
+        (void)offset;
+    }
+
+    void setInitFailureReason(InitFailureReason reason) {
+        m_InitFailureReason = reason;
     }
 
     RendererType getRendererType() {

@@ -16,6 +16,10 @@
 #import <dispatch/dispatch.h>
 #import <Metal/Metal.h>
 
+extern "C" {
+    #include <libavutil/hwcontext_videotoolbox.h>
+}
+
 @interface VTView : NSView
 - (NSView *)hitTest:(NSPoint)point;
 @end
@@ -40,9 +44,11 @@ public:
           m_StreamView(nullptr),
           m_DisplayLink(nullptr),
           m_LastColorSpace(-1),
+          m_LastColorTrc(AVCOL_TRC_UNSPECIFIED),
           m_ColorSpace(nullptr),
           m_VsyncMutex(nullptr),
-          m_VsyncPassed(nullptr)
+          m_VsyncPassed(nullptr),
+          m_VsyncWaitTimeoutMs(100)
     {
         SDL_zero(m_OverlayTextFields);
         for (int i = 0; i < Overlay::OverlayMax; i++) {
@@ -176,6 +182,13 @@ public:
             return false;
         }
 
+        // Tune the wait timeout to the display refresh to avoid spurious timeouts.
+        double refreshPeriod = CVDisplayLinkGetActualOutputVideoRefreshPeriod(m_DisplayLink);
+        if (refreshPeriod > 0.0) {
+            int refreshMs = (int)(refreshPeriod * 1000.0 + 0.5);
+            m_VsyncWaitTimeoutMs = SDL_min(100, SDL_max(8, refreshMs * 2));
+        }
+
         return true;
     }
 
@@ -184,9 +197,10 @@ public:
         if (m_DisplayLink != nullptr) {
             // Vsync is enabled, so wait for a swap before returning
             SDL_LockMutex(m_VsyncMutex);
-            if (SDL_CondWaitTimeout(m_VsyncPassed, m_VsyncMutex, 100) == SDL_MUTEX_TIMEDOUT) {
+            if (SDL_CondWaitTimeout(m_VsyncPassed, m_VsyncMutex, m_VsyncWaitTimeoutMs) == SDL_MUTEX_TIMEDOUT) {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "V-sync wait timed out after 100 ms");
+                            "V-sync wait timed out after %d ms",
+                            m_VsyncWaitTimeoutMs);
             }
             SDL_UnlockMutex(m_VsyncMutex);
         }
@@ -211,6 +225,12 @@ public:
 
         // FFmpeg 5.0+ sets the CVPixelBuffer attachments properly now, so we don't have to
         // fix them up ourselves (except CGColorSpace and PAR attachments).
+        //
+        // Refresh attachments from AVFrame metadata to keep colorspace/range consistent.
+        if (av_vt_pixbuf_set_attachments(nullptr, pixBuf, frame) < 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Failed to update CVPixelBuffer attachments");
+        }
 
         // The VideoToolbox decoder attaches pixel aspect ratio information to the CVPixelBuffer
         // which will rescale the video stream in accordance with the host display resolution
@@ -222,7 +242,7 @@ public:
         // Reset m_ColorSpace if the colorspace changes. This can happen when
         // a game enters HDR mode (Rec 601 -> Rec 2020).
         int colorspace = getFrameColorspace(frame);
-        if (colorspace != m_LastColorSpace) {
+        if (colorspace != m_LastColorSpace || frame->color_trc != m_LastColorTrc) {
             if (m_ColorSpace != nullptr) {
                 CGColorSpaceRelease(m_ColorSpace);
                 m_ColorSpace = nullptr;
@@ -237,6 +257,11 @@ public:
                 if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
                     m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
                 }
+#ifdef kCGColorSpaceITUR_2100_HLG
+                else if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+                    m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_HLG);
+                }
+#endif
                 else {
                     m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020);
                 }
@@ -247,11 +272,20 @@ public:
             }
 
             m_LastColorSpace = colorspace;
+            m_LastColorTrc = frame->color_trc;
         }
 
         if (m_ColorSpace != nullptr) {
             CVBufferSetAttachment(pixBuf, kCVImageBufferCGColorSpaceKey, m_ColorSpace, kCVAttachmentMode_ShouldPropagate);
         }
+
+        const bool wantsEdr =
+            frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+        if (@available(macOS 10.15, *)) {
+            m_DisplayLayer.wantsExtendedDynamicRangeContent = wantsEdr;
+        }
+        // Track the requested EDR mode so the debug HUD can confirm HDR output state.
+        updateHdrOutputState(frame->color_trc, wantsEdr);
 
         // Attach HDR metadata if it has been provided by the host
         if (m_MasteringDisplayColorVolume != nullptr) {
@@ -306,7 +340,7 @@ public:
     { @autoreleasepool {
         int err;
 
-        if (!checkDecoderCapabilities([MTLCreateSystemDefaultDevice() autorelease], params)) {
+        if (!checkDecoderCapabilities(params)) {
             return false;
         }
 
@@ -358,15 +392,13 @@ public:
             m_DisplayLayer.videoGravity = AVLayerVideoGravityResizeAspect;
             m_DisplayLayer.opaque = YES;
 
-            // This workaround prevents the image from going through processing that causes some
-            // color artifacts in some cases. HDR seems to be okay without this, so we'll exclude
-            // it out of caution. The artifacts seem to be far more significant on M1 Macs and
-            // the workaround can cause performance regressions on Intel Macs, so only use this
-            // on Apple silicon.
+            // This workaround prevents the image from going through processing that causes
+            // color artifacts for SDR content on Apple Silicon. HDR looks correct without it,
+            // so we avoid applying it to 10-bit streams.
             //
             // https://github.com/moonlight-stream/moonlight-qt/issues/493
             // https://github.com/moonlight-stream/moonlight-qt/issues/722
-            if (isAppleSilicon() && !(params->videoFormat & VIDEO_FORMAT_MASK_10BIT)) {
+            if (!(params->videoFormat & VIDEO_FORMAT_MASK_10BIT)) {
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Using layer rasterization workaround");
                 if (info.info.cocoa.window.screen != nullptr) {
@@ -451,6 +483,12 @@ public:
         return true;
     }
 
+    virtual bool prepareDecoderContextInGetFormat(AVCodecContext* context, AVPixelFormat pixelFormat) override
+    {
+        // Configure the VideoToolbox hwframes context to keep color range and pool sizing consistent.
+        return configureHwFramesContext(context, m_HwContext, pixelFormat);
+    }
+
     int getDecoderColorspace() override
     {
         // macOS seems to handle Rec 601 best
@@ -483,9 +521,11 @@ private:
     NSTextField* m_OverlayTextFields[Overlay::OverlayMax];
     CVDisplayLinkRef m_DisplayLink;
     int m_LastColorSpace;
+    int m_LastColorTrc;
     CGColorSpaceRef m_ColorSpace;
     SDL_mutex* m_VsyncMutex;
     SDL_cond* m_VsyncPassed;
+    int m_VsyncWaitTimeoutMs;
     bool m_DirectRendering;
 };
 

@@ -75,6 +75,9 @@ public:
           m_CommandQueue(nullptr),
           m_SwMappingTextures{},
           m_MetalView(nullptr),
+          m_UsesUnifiedMemory(false),
+          m_BufferOptions(MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared),
+          m_TextureStorageMode(MTLStorageModeShared),
           m_LastFrameWidth(-1),
           m_LastFrameHeight(-1),
           m_LastDrawableWidth(-1),
@@ -166,6 +169,11 @@ public:
         SDL_FRect renderRect;
         StreamUtils::screenSpaceToNormalizedDeviceCoords(&dst, &renderRect, drawableWidth, drawableHeight);
 
+        if (m_MetalLayer.drawableSize.width != (CGFloat)drawableWidth ||
+            m_MetalLayer.drawableSize.height != (CGFloat)drawableHeight) {
+            m_MetalLayer.drawableSize = CGSizeMake((CGFloat)drawableWidth, (CGFloat)drawableHeight);
+        }
+
         Vertex verts[] =
         {
             { { renderRect.x, renderRect.y, 0.0f, 1.0f }, { 0.0f, 1.0f } },
@@ -175,8 +183,7 @@ public:
         };
 
         [m_VideoVertexBuffer release];
-        auto bufferOptions = MTLCPUCacheModeWriteCombined | MTLResourceStorageModeManaged;
-        m_VideoVertexBuffer = [m_MetalLayer.device newBufferWithBytes:verts length:sizeof(verts) options:bufferOptions];
+        m_VideoVertexBuffer = [m_MetalLayer.device newBufferWithBytes:verts length:sizeof(verts) options:m_BufferOptions];
         if (!m_VideoVertexBuffer) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "Failed to create video vertex buffer");
@@ -245,6 +252,11 @@ public:
                 // https://developer.apple.com/documentation/metal/hdr_content/using_color_spaces_to_display_hdr_content
                 m_MetalLayer.colorspace = newColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
             }
+#ifdef kCGColorSpaceITUR_2100_HLG
+            else if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+                m_MetalLayer.colorspace = newColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_HLG);
+            }
+#endif
             else {
                 m_MetalLayer.colorspace = newColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020);
             }
@@ -255,6 +267,12 @@ public:
             m_MetalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
             break;
         }
+
+        const bool wantsEdr =
+            frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+        m_MetalLayer.wantsExtendedDynamicRangeContent = wantsEdr;
+        // Track the requested EDR mode so the debug HUD can confirm HDR output state.
+        updateHdrOutputState(frame->color_trc, wantsEdr);
 
         std::array<float, 9> cscMatrix;
         std::array<float, 3> yuvOffsets;
@@ -288,8 +306,7 @@ public:
 
         // Create the new colorspace parameter buffer for our fragment shader
         [m_CscParamsBuffer release];
-        auto bufferOptions = MTLCPUCacheModeWriteCombined | MTLResourceStorageModeManaged;
-        m_CscParamsBuffer = [m_MetalLayer.device newBufferWithBytes:(void*)&paramBuffer length:sizeof(paramBuffer) options:bufferOptions];
+        m_CscParamsBuffer = [m_MetalLayer.device newBufferWithBytes:(void*)&paramBuffer length:sizeof(paramBuffer) options:m_BufferOptions];
         if (!m_CscParamsBuffer) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "Failed to create CSC parameters buffer");
@@ -379,7 +396,7 @@ public:
                                                                              height:planeHeight
                                                                           mipmapped:NO];
             texDesc.cpuCacheMode = MTLCPUCacheModeWriteCombined;
-            texDesc.storageMode = MTLStorageModeManaged;
+            texDesc.storageMode = m_TextureStorageMode;
             texDesc.usage = MTLTextureUsageShaderRead;
 
             m_SwMappingTextures[planeIndex] = [m_MetalLayer.device newTextureWithDescriptor:texDesc];
@@ -394,6 +411,7 @@ public:
                                            mipmapLevel:0
                                              withBytes:frame->data[planeIndex]
                                            bytesPerRow:frame->linesize[planeIndex]];
+        notifyTextureModified(m_SwMappingTextures[planeIndex], frame->linesize[planeIndex], planeHeight);
 
         return m_SwMappingTextures[planeIndex];
     }
@@ -417,6 +435,8 @@ public:
                 case kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange:
                 case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
                 case kCVPixelFormatType_444YpCbCr8BiPlanarFullRange:
+                case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
+                case kCVPixelFormatType_422YpCbCr8BiPlanarFullRange:
                     fmt = (i == 0) ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm;
                     break;
 
@@ -424,6 +444,8 @@ public:
                 case kCVPixelFormatType_444YpCbCr10BiPlanarFullRange:
                 case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
                 case kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange:
+                case kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange:
+                case kCVPixelFormatType_422YpCbCr10BiPlanarFullRange:
                     fmt = (i == 0) ? MTLPixelFormatR16Unorm : MTLPixelFormatRG16Unorm;
                     break;
 
@@ -529,9 +551,6 @@ public:
         // Flip to the newly rendered buffer
         [commandBuffer presentDrawable:drawable];
         [commandBuffer commit];
-
-        // Wait for the command buffer to complete and free our CVMetalTextureCache references
-        [commandBuffer waitUntilCompleted];
     }}
 
     // Caller frees frame after we return
@@ -594,34 +613,19 @@ public:
             return nullptr;
         }
 
-        NSArray<id<MTLDevice>> *devices = [MTLCopyAllDevices() autorelease];
-        if (devices.count == 0) {
+        id<MTLDevice> device = [MTLCreateSystemDefaultDevice() autorelease];
+        if (!device) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                          "No Metal device found!");
             return nullptr;
         }
 
-        for (id<MTLDevice> device in devices) {
-            if (device.isLowPower || device.hasUnifiedMemory) {
-                return device;
-            }
-        }
-
-        if (!m_HwAccel) {
-            // Metal software decoding is always available
-            return [MTLCreateSystemDefaultDevice() autorelease];
-        }
-        else if (qgetenv("VT_FORCE_METAL") == "1") {
+        if (qgetenv("VT_FORCE_METAL") == "1") {
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Using Metal renderer due to VT_FORCE_METAL=1 override.");
-            return [MTLCreateSystemDefaultDevice() autorelease];
-        }
-        else {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Avoiding Metal renderer due to use of dGPU/eGPU. Use VT_FORCE_METAL=1 to override.");
         }
 
-        return nullptr;
+        return device;
     }
 
     virtual bool initialize(PDECODER_PARAMETERS params) override
@@ -641,9 +645,11 @@ public:
                     "Selected Metal device: %s",
                     device.name.UTF8String);
 
-        if (m_HwAccel && !checkDecoderCapabilities(device, params)) {
+        if (m_HwAccel && !checkDecoderCapabilities(params)) {
             return false;
         }
+
+        configureResourceOptions(device);
 
         err = av_hwdevice_ctx_create(&m_HwContext,
                                      AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
@@ -676,6 +682,12 @@ public:
 
         // Allow tearing if V-Sync is off (also requires direct display path)
         m_MetalLayer.displaySyncEnabled = params->enableVsync;
+
+        m_MetalLayer.framebufferOnly = YES;
+        if (@available(macOS 10.13, *)) {
+            m_MetalLayer.allowsNextDrawableTimeout = NO;
+            m_MetalLayer.maximumDrawableCount = 2;
+        }
 
         // Create the Metal texture cache for our CVPixelBuffers
         CFStringRef keys[1] = { kCVMetalTextureUsage };
@@ -735,7 +747,7 @@ public:
                                                                          height:newSurface->h
                                                                       mipmapped:NO];
         texDesc.cpuCacheMode = MTLCPUCacheModeWriteCombined;
-        texDesc.storageMode = MTLStorageModeManaged;
+        texDesc.storageMode = m_TextureStorageMode;
         texDesc.usage = MTLTextureUsageShaderRead;
         auto newTexture = [m_MetalLayer.device newTextureWithDescriptor:texDesc];
 
@@ -744,6 +756,7 @@ public:
                       mipmapLevel:0
                         withBytes:newSurface->pixels
                       bytesPerRow:newSurface->pitch];
+        notifyTextureModified(newTexture, newSurface->pitch, newSurface->h);
 
         // The surface is no longer required
         SDL_FreeSurface(newSurface);
@@ -767,10 +780,20 @@ public:
         return true;
     }
 
+    virtual bool prepareDecoderContextInGetFormat(AVCodecContext* context, AVPixelFormat pixelFormat) override
+    {
+        if (!m_HwAccel) {
+            return true;
+        }
+
+        // Configure the VideoToolbox hwframes context to keep color range and pool sizing consistent.
+        return configureHwFramesContext(context, m_HwContext, pixelFormat);
+    }
+
     void startDisplayLink()
     {
         if (@available(macOS 14, *)) {
-            if (m_MetalDisplayLink != nullptr || !m_MetalLayer.displaySyncEnabled || !isAppleSilicon()) {
+            if (m_MetalDisplayLink != nullptr || !m_MetalLayer.displaySyncEnabled) {
                 return;
             }
 
@@ -880,6 +903,10 @@ public:
         if (waitTimeMs < 0) {
             return;
         }
+        // Cap the wait to limit added latency when frames arrive late.
+        if (waitTimeMs > 4) {
+            waitTimeMs = 4;
+        }
 
         // Wait for a new frame to be ready
         SDL_LockMutex(m_FrameLock);
@@ -894,6 +921,28 @@ public:
             renderFrameIntoDrawable(frame, drawable);
             av_frame_free(&frame);
         }
+    }
+
+    void configureResourceOptions(id<MTLDevice> device)
+    {
+        bool hasUnifiedMemory = true;
+        if ([device respondsToSelector:@selector(hasUnifiedMemory)]) {
+            hasUnifiedMemory = device.hasUnifiedMemory;
+        }
+
+        m_UsesUnifiedMemory = hasUnifiedMemory;
+        m_BufferOptions = MTLResourceCPUCacheModeWriteCombined |
+                          (m_UsesUnifiedMemory ? MTLResourceStorageModeShared : MTLResourceStorageModeManaged);
+        // Use shared textures for CPU-updated resources to avoid explicit managed synchronization.
+        m_TextureStorageMode = MTLStorageModeShared;
+    }
+
+    void notifyTextureModified(id<MTLTexture> texture, NSUInteger bytesPerRow, NSUInteger height)
+    {
+        (void)texture;
+        (void)bytesPerRow;
+        (void)height;
+        // Shared textures stay coherent between CPU/GPU on Apple Silicon.
     }
 
 private:
@@ -917,6 +966,9 @@ private:
     id<MTLCommandQueue> m_CommandQueue;
     id<MTLTexture> m_SwMappingTextures[MAX_VIDEO_PLANES];
     SDL_MetalView m_MetalView;
+    bool m_UsesUnifiedMemory;
+    MTLResourceOptions m_BufferOptions;
+    MTLStorageMode m_TextureStorageMode;
     int m_LastFrameWidth;
     int m_LastFrameHeight;
     int m_LastDrawableWidth;

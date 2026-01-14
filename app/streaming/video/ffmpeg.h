@@ -96,6 +96,10 @@ private:
 
     void writeBuffer(PLENTRY entry, int& offset);
 
+    bool configureDecoderSessionIfNeeded();
+
+    bool validateHardwareDecoderFrame(AVFrame* frame);
+
     static
     enum AVPixelFormat ffGetFormat(AVCodecContext* context,
                                    const enum AVPixelFormat* pixFmts);
@@ -130,6 +134,7 @@ private:
     bool m_NeedsSpsFixup;
     bool m_TestOnly;
     TestMode m_CurrentTestMode;
+    bool m_DecoderSessionConfigured;
     SDL_Thread* m_DecoderThread;
     SDL_atomic_t m_DecoderThreadShouldQuit;
 

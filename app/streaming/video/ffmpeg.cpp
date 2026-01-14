@@ -88,6 +88,44 @@ bool FFmpegVideoDecoder::isHardwareAccelerated()
             (getAVCodecCapabilities(m_VideoDecoderCtx->codec) & AV_CODEC_CAP_HARDWARE) != 0;
 }
 
+bool FFmpegVideoDecoder::configureDecoderSessionIfNeeded()
+{
+    if (m_DecoderSessionConfigured || m_BackendRenderer == nullptr || m_VideoDecoderCtx == nullptr) {
+        return m_DecoderSessionConfigured;
+    }
+
+    if (m_BackendRenderer->configureDecoderSession(m_VideoDecoderCtx)) {
+        m_DecoderSessionConfigured = true;
+    }
+
+    return m_DecoderSessionConfigured;
+}
+
+bool FFmpegVideoDecoder::validateHardwareDecoderFrame(AVFrame* frame)
+{
+    if (frame == nullptr || m_HwDecodeCfg == nullptr || m_HwDecodeCfg->pix_fmt == AV_PIX_FMT_NONE) {
+        return true;
+    }
+
+    if (frame->format == m_HwDecodeCfg->pix_fmt) {
+        return true;
+    }
+
+    const char* actualFormat = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format));
+    const char* expectedFormat = av_get_pix_fmt_name(m_HwDecodeCfg->pix_fmt);
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "Hardware decode output format mismatch (expected %s, got %s)",
+                expectedFormat ? expectedFormat : "unknown",
+                actualFormat ? actualFormat : "unknown");
+
+    // Treat silent software fallback as lack of hardware support.
+    if (m_BackendRenderer != nullptr) {
+        m_BackendRenderer->setInitFailureReason(IFFmpegRenderer::InitFailureReason::NoHardwareSupport);
+    }
+
+    return false;
+}
+
 bool FFmpegVideoDecoder::isAlwaysFullScreen()
 {
     return m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_FULLSCREEN_ONLY;
@@ -236,6 +274,7 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_NeedsSpsFixup(false),
       m_TestOnly(testOnly),
       m_CurrentTestMode(TestMode::TestFrameOnly),
+      m_DecoderSessionConfigured(false),
       m_DecoderThread(nullptr)
 {
     SDL_zero(m_ActiveWndVideoStats);
@@ -280,6 +319,7 @@ void FFmpegVideoDecoder::reset()
 
     m_FramesIn = m_FramesOut = 0;
     m_FrameInfoQueue.clear();
+    m_DecoderSessionConfigured = false;
 
     delete m_Pacer;
     m_Pacer = nullptr;
@@ -610,6 +650,9 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
         return false;
     }
 
+    // Allow hardware backends to tune decoder sessions once they're available.
+    configureDecoderSessionIfNeeded();
+
     // FFMpeg doesn't completely initialize the codec until the codec
     // config data comes in. This would be too late for us to change
     // our minds on the selected video codec, so we'll do a trial run
@@ -704,6 +747,14 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
             av_strerror(err, errorstring, sizeof(errorstring));
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Test decode failed (avcodec_receive_frame): %s", errorstring);
+            av_frame_free(&frame);
+            return false;
+        }
+
+        configureDecoderSessionIfNeeded();
+
+        // Validate that the hwaccel decode path didn't silently fall back.
+        if (!validateHardwareDecoderFrame(frame)) {
             av_frame_free(&frame);
             return false;
         }
@@ -960,6 +1011,9 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
 
     if (stats.renderedFrames != 0) {
         char rttString[32];
+        // Expose input/audio queueing to correlate perceived latency with client-side buffering.
+        int pendingInputPackets = LiGetPendingInputPackets();
+        int pendingAudioMs = LiGetPendingAudioDuration();
 
         if (stats.lastRtt != 0) {
             snprintf(rttString, sizeof(rttString), "%u ms (variance: %u ms)", stats.lastRtt, stats.lastRttVariance);
@@ -975,19 +1029,28 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS& stats, char* output, i
                        "Average network latency: %s\n"
                        "Average decoding time: %.2f ms\n"
                        "Average frame queue delay: %.2f ms\n"
-                       "Average rendering time (including monitor V-sync latency): %.2f ms\n",
+                       "Average rendering time (including monitor V-sync latency): %.2f ms\n"
+                       "Input queue depth: %d packets\n"
+                       "Pending audio: %d ms\n",
                        (float)stats.networkDroppedFrames / stats.totalFrames * 100,
                        (float)stats.pacerDroppedFrames / stats.decodedFrames * 100,
                        rttString,
                        (double)(stats.totalDecodeTimeUs / 1000.0) / stats.decodedFrames,
                        (double)(stats.totalPacerTimeUs / 1000.0) / stats.renderedFrames,
-                       (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames);
+                       (double)(stats.totalRenderTimeUs / 1000.0) / stats.renderedFrames,
+                       pendingInputPackets,
+                       pendingAudioMs);
         if (ret < 0 || ret >= length - offset) {
             SDL_assert(false);
             return;
         }
 
         offset += ret;
+    }
+
+    // Allow the renderer to append backend-specific diagnostics to the debug overlay.
+    if (m_FrontendRenderer != nullptr) {
+        m_FrontendRenderer->appendDebugOverlayStats(output, length, &offset);
     }
 }
 
@@ -1860,6 +1923,8 @@ void FFmpegVideoDecoder::decoderThreadProc()
                     SDL_assert(m_FrameInfoQueue.size() == m_FramesIn - m_FramesOut);
                     m_FramesOut++;
 
+                    configureDecoderSessionIfNeeded();
+
                     // Attach HDR metadata to the frame if it's not already present. We will defer to
                     // any metadata contained in the bitstream itself since that is guaranteed to be
                     // correctly synchronized to each frame, unlike our async HDR metadata message.
@@ -2126,4 +2191,3 @@ void FFmpegVideoDecoder::renderFrameOnMainThread()
 {
     m_Pacer->renderOnMainThread();
 }
-

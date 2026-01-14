@@ -16,9 +16,38 @@ SdlAudioRenderer::SdlAudioRenderer()
     }
 }
 
+static int getAdaptiveAudioQueueLimitMs()
+{
+    uint32_t rttVarianceMs = 0;
+    int baseMs = 30;
+
+#if defined(__APPLE__)
+    // CoreAudio tolerates smaller buffers, so target a lower steady-state queue.
+    baseMs = 20;
+#endif
+
+    if (LiGetEstimatedRttInfo(nullptr, &rttVarianceMs)) {
+        int jitterMs = (int)(rttVarianceMs / 2);
+        if (jitterMs > 20) {
+            jitterMs = 20;
+        }
+        baseMs += jitterMs;
+    }
+
+    if (baseMs < 15) {
+        baseMs = 15;
+    }
+    if (baseMs > 60) {
+        baseMs = 60;
+    }
+
+    return baseMs;
+}
+
 bool SdlAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION* opusConfig)
 {
     SDL_AudioSpec want, have;
+    int allowedChanges = 0;
 
     SDL_zero(want);
     want.freq = opusConfig->sampleRate;
@@ -32,11 +61,17 @@ bool SdlAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION* 
     // The buffering helps avoid audio underruns due to network jitter.
     want.samples = SDL_max(480, opusConfig->samplesPerFrame * 3);
 
+#if defined(__APPLE__)
+    // CoreAudio handles smaller buffers well, so aim lower to reduce end-to-end latency.
+    want.samples = SDL_max(240, opusConfig->samplesPerFrame * 2);
+    allowedChanges = SDL_AUDIO_ALLOW_SAMPLES_CHANGE;
+#endif
+
     m_FrameSize = opusConfig->samplesPerFrame *
                   opusConfig->channelCount *
                   getAudioBufferSampleSize();
 
-    m_AudioDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    m_AudioDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, allowedChanges);
     if (m_AudioDevice == 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "Failed to open audio device: %s",
@@ -99,9 +134,8 @@ bool SdlAudioRenderer::submitAudio(int bytesWritten)
         return true;
     }
 
-    // Don't queue if there's already more than 30 ms of audio data waiting
-    // in Moonlight's audio queue.
-    if (LiGetPendingAudioDuration() > 30) {
+    // Don't queue if there's already too much audio data waiting in Moonlight's queue.
+    if (LiGetPendingAudioDuration() > getAdaptiveAudioQueueLimitMs()) {
         return true;
     }
 
