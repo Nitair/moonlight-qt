@@ -98,6 +98,8 @@ private:
     void writeBuffer(PLENTRY entry, int& offset);
 
     bool configureDecoderSessionIfNeeded();
+    bool shouldThrottleOnFocusLoss() const;
+    void enterThrottleMode();
 
     bool validateHardwareDecoderFrame(AVFrame* frame);
 
@@ -138,6 +140,8 @@ private:
     bool m_DecoderSessionConfigured;
     SDL_Thread* m_DecoderThread;
     SDL_atomic_t m_DecoderThreadShouldQuit;
+    SDL_atomic_t m_WindowVisible;
+    bool m_ThrottleOnFocusLoss;
 
     // Data buffers in the queued DU are not valid
     QQueue<DECODE_UNIT> m_FrameInfoQueue;

@@ -29,8 +29,8 @@ fragment half4 ps_draw_biplanar(Vertex v [[ stage_in ]],
 {
     float2 chromaOffset = cscParams.chromaOffset / float2(luminancePlane.get_width(),
                                                           luminancePlane.get_height());
-    float3 yuv = float3(luminancePlane.sample(s, v.texCoords).r,
-                        chrominancePlane.sample(s, v.texCoords + chromaOffset).rg);
+    float2 chromaSample = float2(chrominancePlane.sample(s, v.texCoords + chromaOffset).rg);
+    float3 yuv = float3(luminancePlane.sample(s, v.texCoords).r, chromaSample);
     yuv *= cscParams.bitnessScaleFactor;
     yuv -= cscParams.offsets;
 

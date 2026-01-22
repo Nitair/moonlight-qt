@@ -143,12 +143,32 @@ void FFmpegVideoDecoder::setHdrMode(bool enabled)
 
 void FFmpegVideoDecoder::setWindowVisible(bool visible)
 {
+    SDL_AtomicSet(&m_WindowVisible, visible ? 1 : 0);
     if (m_FrontendRenderer != nullptr) {
         m_FrontendRenderer->setWindowVisible(visible);
     }
     if (m_BackendRenderer != nullptr && m_BackendRenderer != m_FrontendRenderer) {
         m_BackendRenderer->setWindowVisible(visible);
     }
+}
+
+bool FFmpegVideoDecoder::shouldThrottleOnFocusLoss() const
+{
+    return m_ThrottleOnFocusLoss && SDL_AtomicGet(const_cast<SDL_atomic_t*>(&m_WindowVisible)) == 0;
+}
+
+void FFmpegVideoDecoder::enterThrottleMode()
+{
+    if (m_VideoDecoderCtx != nullptr) {
+        avcodec_flush_buffers(m_VideoDecoderCtx);
+    }
+    m_FrameInfoQueue.clear();
+    m_FramesIn = m_FramesOut = 0;
+    m_LastFrameNumber = 0;
+    SDL_zero(m_ActiveWndVideoStats);
+    SDL_zero(m_LastWndVideoStats);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Throttling video decode because the window is hidden");
 }
 
 bool FFmpegVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
@@ -285,13 +305,19 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_TestOnly(testOnly),
       m_CurrentTestMode(TestMode::TestFrameOnly),
       m_DecoderSessionConfigured(false),
-      m_DecoderThread(nullptr)
+      m_DecoderThread(nullptr),
+      m_ThrottleOnFocusLoss(true)
 {
     SDL_zero(m_ActiveWndVideoStats);
     SDL_zero(m_LastWndVideoStats);
     SDL_zero(m_GlobalVideoStats);
 
     SDL_AtomicSet(&m_DecoderThreadShouldQuit, 0);
+    SDL_AtomicSet(&m_WindowVisible, 1);
+    int throttleOverride = 1;
+    if (Utils::getEnvironmentVariableOverride("THROTTLE_ON_FOCUS_LOSS", &throttleOverride)) {
+        m_ThrottleOnFocusLoss = throttleOverride != 0;
+    }
 
     // Use linear filtering when renderer scaling is required
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
@@ -330,6 +356,7 @@ void FFmpegVideoDecoder::reset()
     m_FramesIn = m_FramesOut = 0;
     m_FrameInfoQueue.clear();
     m_DecoderSessionConfigured = false;
+    SDL_AtomicSet(&m_WindowVisible, 1);
 
     delete m_Pacer;
     m_Pacer = nullptr;
@@ -1897,7 +1924,34 @@ int FFmpegVideoDecoder::decoderThreadProcThunk(void *context)
 
 void FFmpegVideoDecoder::decoderThreadProc()
 {
+    bool throttleActive = false;
+
     while (!SDL_AtomicGet(&m_DecoderThreadShouldQuit)) {
+        bool shouldThrottle = shouldThrottleOnFocusLoss();
+        if (shouldThrottle) {
+            if (!throttleActive) {
+                throttleActive = true;
+                enterThrottleMode();
+            }
+
+            VIDEO_FRAME_HANDLE handle;
+            PDECODE_UNIT du;
+            if (LiWaitForNextVideoFrame(&handle, &du)) {
+                LiCompleteVideoFrame(handle, DR_OK);
+            }
+            else {
+                SDL_Delay(5);
+            }
+
+            continue;
+        }
+        else if (throttleActive) {
+            throttleActive = false;
+            LiRequestIdrFrame();
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Resuming video decode after window became visible");
+        }
+
         if (m_FramesIn == m_FramesOut) {
             VIDEO_FRAME_HANDLE handle;
             PDECODE_UNIT du;
