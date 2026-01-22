@@ -24,15 +24,15 @@ extern "C" {
 
 struct CscParams
 {
-    simd_half3x3 matrix;
-    simd_half3 offsets;
+    simd_float3x3 matrix;
+    simd_float3 offsets;
 };
 
 struct ParamBuffer
 {
     CscParams cscParams;
-    simd_half2 chromaOffset;
-    simd_half1 bitnessScaleFactor;
+    simd_float2 chromaOffset;
+    float bitnessScaleFactor;
 };
 
 struct Vertex
@@ -56,32 +56,36 @@ class VTMetalRenderer : public VTBaseRenderer
 public:
     VTMetalRenderer(bool hwAccel)
         : VTBaseRenderer(RendererType::VTMetal),
-          m_HwAccel(hwAccel),
-          m_Window(nullptr),
-          m_HwContext(nullptr),
-          m_MetalLayer(nullptr),
-          m_MetalDisplayLink(nullptr),
-          m_LatestUnrenderedFrame(nullptr),
-          m_FrameLock(SDL_CreateMutex()),
-          m_FrameReady(SDL_CreateCond()),
-          m_TextureCache(nullptr),
-          m_CscParamsBuffer(nullptr),
-          m_VideoVertexBuffer(nullptr),
-          m_OverlayTextures{},
-          m_OverlayLock(0),
-          m_VideoPipelineState(nullptr),
-          m_OverlayPipelineState(nullptr),
-          m_ShaderLibrary(nullptr),
-          m_CommandQueue(nullptr),
-          m_SwMappingTextures{},
-          m_MetalView(nullptr),
-          m_UsesUnifiedMemory(false),
-          m_BufferOptions(MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared),
-          m_TextureStorageMode(MTLStorageModeShared),
-          m_LastFrameWidth(-1),
-          m_LastFrameHeight(-1),
-          m_LastDrawableWidth(-1),
-          m_LastDrawableHeight(-1)
+        m_LastPipelinePixelFormat(MTLPixelFormatInvalid),
+        m_LastPipelinePlaneCount(0),
+        m_LastOverlayPixelFormat(MTLPixelFormatInvalid),
+        m_HwAccel(hwAccel),
+        m_Window(nullptr),
+        m_HwContext(nullptr),
+        m_MetalLayer(nullptr),
+        m_MetalDisplayLink(nullptr),
+        m_LatestUnrenderedFrame(nullptr),
+        m_FrameLock(SDL_CreateMutex()),
+        m_FrameReady(SDL_CreateCond()),
+        m_TextureCache(nullptr),
+        m_CscParamsBuffer(nullptr),
+        m_VideoVertexBuffer(nullptr),
+        m_OverlayTextures{},
+        m_OverlayLock(0),
+        m_VideoPipelineState(nullptr),
+        m_OverlayPipelineState(nullptr),
+        m_ShaderLibrary(nullptr),
+        m_CommandQueue(nullptr),
+        m_SwMappingTextures{},
+        m_MetalView(nullptr),
+        m_UsesUnifiedMemory(false),
+        m_BufferOptions(MTLResourceCPUCacheModeWriteCombined | MTLResourceStorageModeShared),
+        m_TextureStorageMode(MTLStorageModeShared),
+        m_WindowVisible(true),
+        m_LastFrameWidth(-1),
+        m_LastFrameHeight(-1),
+        m_LastDrawableWidth(-1),
+        m_LastDrawableHeight(-1)
     {
     }
 
@@ -141,6 +145,28 @@ public:
             SDL_Metal_DestroyView(m_MetalView);
         }
     }}
+
+    void clearPendingFrame()
+    {
+        SDL_LockMutex(m_FrameLock);
+        if (m_LatestUnrenderedFrame != nullptr) {
+            av_frame_free(&m_LatestUnrenderedFrame);
+            m_LatestUnrenderedFrame = nullptr;
+        }
+        SDL_UnlockMutex(m_FrameLock);
+    }
+
+    virtual void setWindowVisible(bool visible) override
+    {
+        m_WindowVisible = visible;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "VTMetalRenderer window visible: %s",
+                    m_WindowVisible ? "true" : "false");
+        if (!m_WindowVisible) {
+            stopDisplayLink();
+            clearPendingFrame();
+        }
+    }
 
     bool updateVideoRegionSizeForFrame(AVFrame* frame)
     {
@@ -280,14 +306,14 @@ public:
         getFramePremultipliedCscConstants(frame, cscMatrix, yuvOffsets);
         getFrameChromaCositingOffsets(frame, chromaOffset);
 
-        paramBuffer.cscParams.matrix = simd_matrix(simd_make_half3(cscMatrix[0], cscMatrix[3], cscMatrix[6]),
-                                                   simd_make_half3(cscMatrix[1], cscMatrix[4], cscMatrix[7]),
-                                                   simd_make_half3(cscMatrix[2], cscMatrix[5], cscMatrix[8]));
-        paramBuffer.cscParams.offsets = simd_make_half3(yuvOffsets[0],
-                                                        yuvOffsets[1],
-                                                        yuvOffsets[2]);
-        paramBuffer.chromaOffset = simd_make_half2(chromaOffset[0],
-                                                   chromaOffset[1]);
+        paramBuffer.cscParams.matrix = simd_matrix(simd_make_float3(cscMatrix[0], cscMatrix[3], cscMatrix[6]),
+                               simd_make_float3(cscMatrix[1], cscMatrix[4], cscMatrix[7]),
+                               simd_make_float3(cscMatrix[2], cscMatrix[5], cscMatrix[8]));
+        paramBuffer.cscParams.offsets = simd_make_float3(yuvOffsets[0],
+                                yuvOffsets[1],
+                                yuvOffsets[2]);
+        paramBuffer.chromaOffset = simd_make_float2(chromaOffset[0],
+                               chromaOffset[1]);
 
         // Set the EDR metadata for HDR10 to enable OS tonemapping
         if (frame->color_trc == AVCOL_TRC_SMPTE2084 && m_MasteringDisplayColorVolume != nullptr) {
@@ -316,35 +342,49 @@ public:
         int planes = getFramePlaneCount(frame);
         SDL_assert(planes == 2 || planes == 3);
 
-        MTLRenderPipelineDescriptor *pipelineDesc = [[MTLRenderPipelineDescriptor new] autorelease];
-        pipelineDesc.vertexFunction = [[m_ShaderLibrary newFunctionWithName:@"vs_draw"] autorelease];
-        pipelineDesc.fragmentFunction = [[m_ShaderLibrary newFunctionWithName:planes == 2 ? @"ps_draw_biplanar" : @"ps_draw_triplanar"] autorelease];
-        pipelineDesc.colorAttachments[0].pixelFormat = m_MetalLayer.pixelFormat;
-        [m_VideoPipelineState release];
-        m_VideoPipelineState = [m_MetalLayer.device newRenderPipelineStateWithDescriptor:pipelineDesc error:nullptr];
-        if (!m_VideoPipelineState) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Failed to create video pipeline state");
-            return false;
+        bool needVideoPipeline = m_VideoPipelineState == nullptr ||
+                     planes != m_LastPipelinePlaneCount ||
+                     m_MetalLayer.pixelFormat != m_LastPipelinePixelFormat;
+
+        bool needOverlayPipeline = m_OverlayPipelineState == nullptr ||
+                        m_MetalLayer.pixelFormat != m_LastOverlayPixelFormat;
+
+        if (needVideoPipeline) {
+            MTLRenderPipelineDescriptor *pipelineDesc = [[MTLRenderPipelineDescriptor new] autorelease];
+            pipelineDesc.vertexFunction = [[m_ShaderLibrary newFunctionWithName:@"vs_draw"] autorelease];
+            pipelineDesc.fragmentFunction = [[m_ShaderLibrary newFunctionWithName:planes == 2 ? @"ps_draw_biplanar" : @"ps_draw_triplanar"] autorelease];
+            pipelineDesc.colorAttachments[0].pixelFormat = m_MetalLayer.pixelFormat;
+            [m_VideoPipelineState release];
+            m_VideoPipelineState = [m_MetalLayer.device newRenderPipelineStateWithDescriptor:pipelineDesc error:nullptr];
+            if (!m_VideoPipelineState) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Failed to create video pipeline state");
+                return false;
+            }
+            m_LastPipelinePixelFormat = m_MetalLayer.pixelFormat;
+            m_LastPipelinePlaneCount = planes;
         }
 
-        pipelineDesc = [[MTLRenderPipelineDescriptor new] autorelease];
-        pipelineDesc.vertexFunction = [[m_ShaderLibrary newFunctionWithName:@"vs_draw"] autorelease];
-        pipelineDesc.fragmentFunction = [[m_ShaderLibrary newFunctionWithName:@"ps_draw_rgb"] autorelease];
-        pipelineDesc.colorAttachments[0].pixelFormat = m_MetalLayer.pixelFormat;
-        pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-        pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-        pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-        pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-        pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
-        pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        [m_OverlayPipelineState release];
-        m_OverlayPipelineState = [m_MetalLayer.device newRenderPipelineStateWithDescriptor:pipelineDesc error:nullptr];
-        if (!m_VideoPipelineState) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Failed to create overlay pipeline state");
-            return false;
+        if (needOverlayPipeline) {
+            MTLRenderPipelineDescriptor *pipelineDesc = [[MTLRenderPipelineDescriptor new] autorelease];
+            pipelineDesc.vertexFunction = [[m_ShaderLibrary newFunctionWithName:@"vs_draw"] autorelease];
+            pipelineDesc.fragmentFunction = [[m_ShaderLibrary newFunctionWithName:@"ps_draw_rgb"] autorelease];
+            pipelineDesc.colorAttachments[0].pixelFormat = m_MetalLayer.pixelFormat;
+            pipelineDesc.colorAttachments[0].blendingEnabled = YES;
+            pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+            pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+            pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+            pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            [m_OverlayPipelineState release];
+            m_OverlayPipelineState = [m_MetalLayer.device newRenderPipelineStateWithDescriptor:pipelineDesc error:nullptr];
+            if (!m_OverlayPipelineState) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "Failed to create overlay pipeline state");
+                return false;
+            }
+            m_LastOverlayPixelFormat = m_MetalLayer.pixelFormat;
         }
 
         m_HdrMetadataChanged = false;
@@ -423,6 +463,15 @@ public:
         size_t planes = getFramePlaneCount(frame);
         SDL_assert(planes <= MAX_VIDEO_PLANES);
 
+        auto releaseMetalTextures = [&]() {
+            for (size_t j = 0; j < planes; j++) {
+                if (cvMetalTextures[j] != nullptr) {
+                    CFRelease(cvMetalTextures[j]);
+                    cvMetalTextures[j] = nullptr;
+                }
+            }
+        };
+
         if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
             CVPixelBufferRef pixBuf = reinterpret_cast<CVPixelBufferRef>(frame->data[3]);
 
@@ -465,6 +514,7 @@ public:
                     SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                                  "CVMetalTextureCacheCreateTextureFromImage() failed: %d",
                                  err);
+                    releaseMetalTextures();
                     return;
                 }
             }
@@ -556,6 +606,9 @@ public:
     // Caller frees frame after we return
     virtual void renderFrame(AVFrame* frame) override
     { @autoreleasepool {
+        if (!m_WindowVisible) {
+            return;
+        }
         // Handle changes to the frame's colorspace from last time we rendered
         if (!updateColorSpaceForFrame(frame)) {
             // Trigger the main thread to recreate the decoder
@@ -728,14 +781,17 @@ public:
 
         SDL_AtomicLock(&m_OverlayLock);
         auto oldTexture = m_OverlayTextures[type];
-        m_OverlayTextures[type] = nullptr;
+        if (!overlayEnabled) {
+            m_OverlayTextures[type] = nullptr;
+        }
         SDL_AtomicUnlock(&m_OverlayLock);
-
-        [oldTexture release];
 
         // If the overlay is disabled, we're done
         if (!overlayEnabled) {
             SDL_FreeSurface(newSurface);
+            if (oldTexture != nullptr) {
+                [oldTexture release];
+            }
             return;
         }
 
@@ -750,6 +806,12 @@ public:
         texDesc.storageMode = m_TextureStorageMode;
         texDesc.usage = MTLTextureUsageShaderRead;
         auto newTexture = [m_MetalLayer.device newTextureWithDescriptor:texDesc];
+        if (newTexture == nullptr) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Failed to allocate overlay texture");
+            SDL_FreeSurface(newSurface);
+            return;
+        }
 
         // Load the pixel data into the new texture
         [newTexture replaceRegion:MTLRegionMake2D(0, 0, newSurface->w, newSurface->h)
@@ -765,6 +827,10 @@ public:
         SDL_AtomicLock(&m_OverlayLock);
         m_OverlayTextures[type] = newTexture;
         SDL_AtomicUnlock(&m_OverlayLock);
+
+        if (oldTexture != nullptr) {
+            [oldTexture release];
+        }
     }}
 
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary**) override
@@ -792,6 +858,9 @@ public:
 
     void startDisplayLink()
     {
+        if (!m_WindowVisible) {
+            return;
+        }
         if (@available(macOS 14, *)) {
             if (m_MetalDisplayLink != nullptr || !m_MetalLayer.displaySyncEnabled) {
                 return;
@@ -894,6 +963,9 @@ public:
 
     void renderLatestFrameOnDrawable(id<CAMetalDrawable> drawable, CFTimeInterval targetTimestamp)
     {
+        if (!m_WindowVisible) {
+            return;
+        }
         AVFrame* frame = nullptr;
 
         // Determine how long we can wait depending on how long our CAMetalDisplayLink
@@ -946,6 +1018,10 @@ public:
     }
 
 private:
+    protected:
+        MTLPixelFormat m_LastPipelinePixelFormat;
+        int m_LastPipelinePlaneCount;
+        MTLPixelFormat m_LastOverlayPixelFormat;
     bool m_HwAccel;
     SDL_Window* m_Window;
     AVBufferRef* m_HwContext;
@@ -969,6 +1045,7 @@ private:
     bool m_UsesUnifiedMemory;
     MTLResourceOptions m_BufferOptions;
     MTLStorageMode m_TextureStorageMode;
+    bool m_WindowVisible;
     int m_LastFrameWidth;
     int m_LastFrameHeight;
     int m_LastDrawableWidth;

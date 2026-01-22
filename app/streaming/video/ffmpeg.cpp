@@ -141,6 +141,16 @@ void FFmpegVideoDecoder::setHdrMode(bool enabled)
     m_FrontendRenderer->setHdrMode(enabled);
 }
 
+void FFmpegVideoDecoder::setWindowVisible(bool visible)
+{
+    if (m_FrontendRenderer != nullptr) {
+        m_FrontendRenderer->setWindowVisible(visible);
+    }
+    if (m_BackendRenderer != nullptr && m_BackendRenderer != m_FrontendRenderer) {
+        m_BackendRenderer->setWindowVisible(visible);
+    }
+}
+
 bool FFmpegVideoDecoder::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
 {
     return m_FrontendRenderer->notifyWindowChanged(info);

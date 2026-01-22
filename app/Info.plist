@@ -21,7 +21,7 @@
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>11.0.0</string>
+	<string>26.0</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
@@ -43,9 +43,9 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Moonlight uses the local network to connect to your gaming PC for streaming.</string>
 	<key>CFBundleVersion</key>
-	<string>6.1.0</string>
+	<string>VERSION</string>
 	<key>CFBundleShortVersionString</key>
-	<string>6.1.0</string>
+	<string>VERSION</string>
 	<key>CFBundleDisplayName</key>
 	<string>Moonlight</string>
     <key>LSApplicationCategoryType</key>

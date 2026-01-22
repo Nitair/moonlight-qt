@@ -28,6 +28,7 @@ public:
     virtual int submitDecodeUnit(PDECODE_UNIT du) override;
     virtual void renderFrameOnMainThread() override;
     virtual void setHdrMode(bool enabled) override;
+    virtual void setWindowVisible(bool visible) override;
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info) override;
 
     virtual IFFmpegRenderer* getBackendRenderer();

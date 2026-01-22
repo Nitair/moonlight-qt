@@ -5,6 +5,10 @@ SUBDIRS = \
     app \
     h264bitstream
 
+macx {
+    QMAKE_MACOSX_DEPLOYMENT_TARGET = 26.0
+}
+
 # Build the dependencies in parallel before the final app
 app.depends = qmdnsengine moonlight-common-c h264bitstream
 win32:!winrt {

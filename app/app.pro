@@ -249,6 +249,10 @@ HEADERS += \
     streaming/video/overlaymanager.h \
     backend/systemproperties.h
 
+macx {
+    QMAKE_MACOSX_DEPLOYMENT_TARGET = 26.0
+}
+
 # Platform-specific renderers and decoders
 ffmpeg {
     message(FFmpeg decoder selected)

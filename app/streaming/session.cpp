@@ -2000,6 +2000,18 @@ void Session::exec()
 
     // Hijack this thread to be the SDL main thread. We have to do this
     // because we want to suspend all Qt processing until the stream is over.
+    auto updateWindowVisibleState = [&](bool visible) {
+        if (visible != m_WindowVisible) {
+            m_WindowVisible = visible;
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Session visibility change, now %s",
+                        m_WindowVisible ? "visible" : "hidden");
+            if (m_VideoDecoder != nullptr) {
+                m_VideoDecoder->setWindowVisible(m_WindowVisible);
+            }
+        }
+    };
+
     SDL_Event event;
     for (;;) {
 #if SDL_VERSION_ATLEAST(2, 0, 18) && !defined(STEAM_LINK)
@@ -2079,7 +2091,7 @@ void Session::exec()
             }
             break;
 
-        case SDL_WINDOWEVENT:
+        case SDL_WINDOWEVENT: {
             // Early handling of some events
             switch (event.window.event) {
             case SDL_WINDOWEVENT_FOCUS_LOST:
@@ -2087,17 +2099,35 @@ void Session::exec()
                     m_AudioMuted = true;
                 }
                 m_InputHandler->notifyFocusLost();
+                updateWindowVisibleState(false);
                 break;
             case SDL_WINDOWEVENT_FOCUS_GAINED:
                 if (m_Preferences->muteOnFocusLoss) {
                     m_AudioMuted = false;
                 }
                 m_InputHandler->notifyFocusGained();
+                updateWindowVisibleState(true);
                 break;
             case SDL_WINDOWEVENT_LEAVE:
                 m_InputHandler->notifyMouseLeave();
                 break;
             }
+
+            bool nextVisible = m_WindowVisible;
+            switch (event.window.event) {
+            case SDL_WINDOWEVENT_HIDDEN:
+            case SDL_WINDOWEVENT_MINIMIZED:
+                nextVisible = false;
+                break;
+            case SDL_WINDOWEVENT_SHOWN:
+            case SDL_WINDOWEVENT_RESTORED:
+                nextVisible = true;
+                break;
+            default:
+                break;
+            }
+
+            updateWindowVisibleState(nextVisible);
 
             presence.runCallbacks();
 
@@ -2198,6 +2228,8 @@ void Session::exec()
                         event.window.event,
                         event.window.data1,
                         event.window.data2);
+
+        }
 
             // Fall through
         case SDL_RENDER_DEVICE_RESET:

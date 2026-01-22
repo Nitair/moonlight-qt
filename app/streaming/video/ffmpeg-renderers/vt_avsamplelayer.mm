@@ -15,6 +15,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <dispatch/dispatch.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
 
 extern "C" {
     #include <libavutil/hwcontext_videotoolbox.h>
@@ -33,6 +34,14 @@ extern "C" {
 
 @end
 
+@class CADisplayLink;
+class VTRenderer;
+
+@interface VTRendererDisplayLinkProxy : NSObject
+- (instancetype)initWithRenderer:(VTRenderer *)renderer;
+- (void)displayLinkDidFire:(CADisplayLink *)displayLink;
+@end
+
 class VTRenderer : public VTBaseRenderer
 {
 public:
@@ -43,6 +52,7 @@ public:
           m_FormatDesc(nullptr),
           m_StreamView(nullptr),
           m_DisplayLink(nullptr),
+          m_DisplayLinkProxy(nullptr),
           m_LastColorSpace(-1),
           m_LastColorTrc(AVCOL_TRC_UNSPECIFIED),
           m_ColorSpace(nullptr),
@@ -68,8 +78,14 @@ public:
         }
 
         if (m_DisplayLink != nullptr) {
-            CVDisplayLinkStop(m_DisplayLink);
-            CVDisplayLinkRelease(m_DisplayLink);
+            [m_DisplayLink invalidate];
+            [m_DisplayLink release];
+            m_DisplayLink = nullptr;
+        }
+
+        if (m_DisplayLinkProxy != nullptr) {
+            [m_DisplayLinkProxy release];
+            m_DisplayLinkProxy = nullptr;
         }
 
         if (m_VsyncPassed != nullptr) {
@@ -113,77 +129,40 @@ public:
         SDL_PumpEvents();
     }}
 
-    static
-    CVReturn
-    displayLinkOutputCallback(
-        CVDisplayLinkRef displayLink,
-        const CVTimeStamp* /* now */,
-        const CVTimeStamp* /* vsyncTime */,
-        CVOptionFlags,
-        CVOptionFlags*,
-        void *displayLinkContext)
+    void onDisplayLinkFired(CADisplayLink* link)
     {
-        auto me = reinterpret_cast<VTRenderer*>(displayLinkContext);
-
-        SDL_assert(displayLink == me->m_DisplayLink);
-
-        SDL_LockMutex(me->m_VsyncMutex);
-        SDL_CondSignal(me->m_VsyncPassed);
-        SDL_UnlockMutex(me->m_VsyncMutex);
-
-        return kCVReturnSuccess;
+        Q_UNUSED(link);
+        SDL_LockMutex(m_VsyncMutex);
+        SDL_CondSignal(m_VsyncPassed);
+        SDL_UnlockMutex(m_VsyncMutex);
     }
 
-    bool initializeVsyncCallback(SDL_SysWMinfo* info)
+    bool initializeVsyncCallback(SDL_SysWMinfo*)
     {
-        NSScreen* screen = [info->info.cocoa.window screen];
-        CVReturn status;
-        if (screen == nullptr) {
-            // Window not visible on any display, so use a
-            // CVDisplayLink that can work with all active displays.
-            // When we become visible, we'll recreate ourselves
-            // and associate with the new screen.
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "NSWindow is not visible on any display");
-            status = CVDisplayLinkCreateWithActiveCGDisplays(&m_DisplayLink);
-        }
-        else {
-            CGDirectDisplayID displayId = [[screen deviceDescription][@"NSScreenNumber"] unsignedIntValue];
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "NSWindow on display: %x",
-                        displayId);
-            status = CVDisplayLinkCreateWithCGDisplay(displayId, &m_DisplayLink);
-        }
-        if (status != kCVReturnSuccess) {
+        if (m_StreamView == nullptr) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Failed to create CVDisplayLink: %d",
-                         status);
+                         "Cannot create display link without a stream view");
             return false;
         }
 
-        status = CVDisplayLinkSetOutputCallback(m_DisplayLink, displayLinkOutputCallback, this);
-        if (status != kCVReturnSuccess) {
+        auto proxy = [[VTRendererDisplayLinkProxy alloc] initWithRenderer:this];
+        CADisplayLink* displayLink = [m_StreamView displayLinkWithTarget:proxy selector:@selector(displayLinkDidFire:)];
+        if (displayLink == nullptr) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "CVDisplayLinkSetOutputCallback() failed: %d",
-                         status);
+                         "displayLinkWithTarget:selector: failed");
+            [proxy release];
             return false;
         }
 
-        // The CVDisplayLink callback uses these, so we must initialize them before
-        // starting the callbacks.
+        [displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+        m_DisplayLink = [displayLink retain];
+        m_DisplayLinkProxy = proxy;
+
         m_VsyncMutex = SDL_CreateMutex();
         m_VsyncPassed = SDL_CreateCond();
 
-        status = CVDisplayLinkStart(m_DisplayLink);
-        if (status != kCVReturnSuccess) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "CVDisplayLinkStart() failed: %d",
-                         status);
-            return false;
-        }
-
-        // Tune the wait timeout to the display refresh to avoid spurious timeouts.
-        double refreshPeriod = CVDisplayLinkGetActualOutputVideoRefreshPeriod(m_DisplayLink);
+        double refreshPeriod = [m_DisplayLink duration];
         if (refreshPeriod > 0.0) {
             int refreshMs = (int)(refreshPeriod * 1000.0 + 0.5);
             m_VsyncWaitTimeoutMs = SDL_min(100, SDL_max(8, refreshMs * 2));
@@ -211,8 +190,10 @@ public:
     { @autoreleasepool {
         OSStatus status;
         CVPixelBufferRef pixBuf = reinterpret_cast<CVPixelBufferRef>(frame->data[3]);
+        AVSampleBufferVideoRenderer* sampleBufferRenderer = m_DisplayLayer.sampleBufferRenderer;
 
-        if (m_DisplayLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+        if (sampleBufferRenderer != nullptr &&
+            sampleBufferRenderer.status == AVQueuedSampleBufferRenderingStatusFailed) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "Resetting failed AVSampleBufferDisplay layer");
 
@@ -281,8 +262,13 @@ public:
 
         const bool wantsEdr =
             frame->color_trc == AVCOL_TRC_SMPTE2084 || frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
-        if (@available(macOS 10.15, *)) {
+        if (@available(macOS 26.0, *)) {
+            m_DisplayLayer.preferredDynamicRange = wantsEdr ? CADynamicRangeHigh : CADynamicRangeStandard;
+        } else if (@available(macOS 10.15, *)) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
             m_DisplayLayer.wantsExtendedDynamicRangeContent = wantsEdr;
+#pragma clang diagnostic pop
         }
         // Track the requested EDR mode so the debug HUD can confirm HDR output state.
         updateHdrOutputState(frame->color_trc, wantsEdr);
@@ -331,7 +317,14 @@ public:
             return;
         }
 
-        [m_DisplayLayer enqueueSampleBuffer:sampleBuffer];
+        if (sampleBufferRenderer != nullptr) {
+            [sampleBufferRenderer enqueueSampleBuffer:sampleBuffer];
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [m_DisplayLayer enqueueSampleBuffer:sampleBuffer];
+#pragma clang diagnostic pop
+        }
 
         CFRelease(sampleBuffer);
     }}
@@ -519,7 +512,8 @@ private:
     NSView* m_StreamView;
     dispatch_block_t m_OverlayUpdateBlocks[Overlay::OverlayMax];
     NSTextField* m_OverlayTextFields[Overlay::OverlayMax];
-    CVDisplayLinkRef m_DisplayLink;
+    CADisplayLink* m_DisplayLink;
+    VTRendererDisplayLinkProxy* m_DisplayLinkProxy;
     int m_LastColorSpace;
     int m_LastColorTrc;
     CGColorSpaceRef m_ColorSpace;
@@ -528,6 +522,27 @@ private:
     int m_VsyncWaitTimeoutMs;
     bool m_DirectRendering;
 };
+
+@implementation VTRendererDisplayLinkProxy {
+    VTRenderer* m_Renderer;
+}
+
+- (instancetype)initWithRenderer:(VTRenderer *)renderer
+{
+    if (self = [super init]) {
+        m_Renderer = renderer;
+    }
+    return self;
+}
+
+- (void)displayLinkDidFire:(CADisplayLink *)displayLink
+{
+    if (m_Renderer != nullptr) {
+        m_Renderer->onDisplayLinkFired(displayLink);
+    }
+}
+
+@end
 
 IFFmpegRenderer* VTRendererFactory::createRenderer() {
     return new VTRenderer();

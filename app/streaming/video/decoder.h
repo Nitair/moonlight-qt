@@ -75,5 +75,6 @@ public:
     virtual int submitDecodeUnit(PDECODE_UNIT du) = 0;
     virtual void renderFrameOnMainThread() = 0;
     virtual void setHdrMode(bool enabled) = 0;
+    virtual void setWindowVisible(bool visible) { (void)visible; }
     virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info) = 0;
 };

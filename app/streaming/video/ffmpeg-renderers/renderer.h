@@ -285,6 +285,10 @@ public:
         // Nothing
     }
 
+    virtual void setWindowVisible(bool) {
+        // Nothing
+    }
+
     virtual bool prepareDecoderContextInGetFormat(AVCodecContext*, AVPixelFormat) {
         // Assume no further initialization is required
         return true;
